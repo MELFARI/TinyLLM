@@ -8,7 +8,7 @@ from google.colab import drive #Save checpoints, if they dont save when Colab ge
 drive.mount('/content/drive')
 # --- API Key Setup ---
 # Set your API key securely (you can paste it here, but better use Colab's "Secrets" if possible)
-os.environ["OPENROUTER_API_KEY"] = "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"
+os.environ["OPENROUTER_API_KEY"] = ""
 
 #Loading in the Professor(GPT-OSS-12Ob) and TA(Qwen3-4B)
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
