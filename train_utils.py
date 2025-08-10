@@ -1,103 +1,72 @@
-import torch
+# --- Imports ---
 import os
-import shutil
+import requests
 import logging
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
-from transformers import T5ForConditionalGeneration
-from transformers import DataCollatorForSeq2Seq
-from transformers.trainer_utils import set_seed
-from model_utils import MultiTeacherDataCollator, MultiTeacherTrainer
+import json
+from tqdm import tqdm
+from google.colab import drive #Save checpoints, if they dont save when Colab gets disconnected
+drive.mount('/content/drive')
+# --- API Key Setup ---
+# Set your API key securely (you can paste it here, but better use Colab's "Secrets" if possible)
+os.environ["OPENROUTER_API_KEY"] = "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"
 
-def get_config_dir(args):
-    """
-    Constructs a directory path based on training arguments for model configurations.
+#Loading in the Professor(GPT-OSS-12Ob) and TA(Qwen3-4B)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise ValueError("Please set your OpenRouter API key as OPENROUTER_API_KEY environment variable")
 
-    Args:
-        args: Command-line arguments or any arguments object with necessary attributes.
+# --- Base URL ---
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
-    Returns:
-        A string representing the path to the configuration directory.
-    """
-    return f'{args.dataset}/{args.from_pretrained.split("/")[1]}_{args.gamma}_{args.alpha}_{args.beta}_{args.max_input_length}_{args.grad_steps*args.batch_size}_{args.optimizer_name}_{args.lr}'
-
-def train_and_evaluate(args, run, tokenizer, tokenized_datasets, compute_metrics):
-    """
-    Sets up and runs the training and evaluation process for a sequence-to-sequence model.
-
-    Args:
-        args: Training configuration arguments.
-        run: Integer representing the current run or seed for reproducibility.
-        tokenizer: Tokenizer object for text preprocessing.
-        tokenized_datasets: Tokenized datasets for training and evaluation.
-        compute_metrics: Function to compute metrics during evaluation.
-
-    This function initializes the model, sets up training arguments, data collator, and trainer,
-    and then starts the training process.
-    """
-    set_seed(run)  # Ensure reproducibility
-
-    model = T5ForConditionalGeneration.from_pretrained(args.from_pretrained)
-
-    # Configuration directories for output and logging
-    config_dir = get_config_dir(args)
-    output_dir = f'ckpts/{config_dir}/{run}'
-    logging_dir = f'logs/{config_dir}/{run}'
-
-    # Adjust logging strategy based on arguments
-    if args.no_log:
-        logging_strategy = 'no'
-        logging_dir = None
-    else:
-        logging_strategy = 'steps'
-
-    # Clear existing checkpoint directory for a fresh start
-    if os.path.exists(output_dir):
-        logging.info('Found existing ckpt directory. Deleted the old directory for the latest run.')
-        shutil.rmtree(output_dir)
-
-    # Setup training arguments for the Seq2SeqTrainer
-    training_args = Seq2SeqTrainingArguments(
-        output_dir,
-        remove_unused_columns=False,
-        evaluation_strategy='steps',
-        eval_steps=args.eval_steps,
-        save_strategy='no',
-        save_steps=args.eval_steps,
-        logging_dir=logging_dir,
-        logging_strategy=logging_strategy,
-        logging_steps=args.eval_steps,
-        max_steps=args.max_steps,
-        learning_rate=args.lr,
-        gradient_accumulation_steps=args.grad_steps,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        predict_with_generate=True,
-        seed=run,
-        local_rank=args.local_rank,
-        bf16=args.bf16,
-        generation_max_length=args.gen_max_len,
-        prediction_loss_only=False,
-    )
-
-    # Initialize the data collator for handling batching and tokenization
-    data_collator = MultiTeacherDataCollator(tokenizer=tokenizer, model=model)
-
-    # Trainer setup with custom arguments for the training process
-    trainer_kwargs = {
-        'alpha': args.alpha,
-        'beta': args.beta,
-        'gamma': args.gamma,
-        'output_rationale': args.output_rationale,
-        'model': model,
-        'args': training_args,
-        'train_dataset': tokenized_datasets["train"],
-        'eval_dataset': {'test': tokenized_datasets["test"], },
-        'data_collator': data_collator,
-        'tokenizer': tokenizer,
-        'compute_metrics': compute_metrics,
+# --- Model IDs ---
+PROFESSOR_MODEL = "openai/gpt-oss-120b"     # Professor
+TA_MODEL = "qwen/qwen3-4b:free"               # TA
+def query_openrouter(model_id, messages):
+    """Send a request to OpenRouter model API."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
     }
 
-    # Initialize and run the trainer
-    trainer = MultiTeacherTrainer(**trainer_kwargs)
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "max_tokens": 512
+    }
+    print("Request payload:", payload) # Add print statement here
+    response = requests.post(OPENROUTER_URL, headers=headers, json=payload)
 
-    trainer.train()
+    print(f"Status Code: {response.status_code}")
+    print(f"Response Text: {response.text}")  # See exactly what server returned
+
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"],
+    
+    def create_kd_dataset(prompts, output_path="kd_dataset.jsonl"):
+    """
+    Create a dataset of teacher outputs for KD training.
+    """
+    with open(output_path, "w", encoding="utf-8") as f:
+        for prompt in tqdm(prompts, desc="Generating teacher outputs"):
+            teacher_response = query_openrouter(PROFESSOR_MODEL, [{"role": "user", "content": prompt}])
+            if teacher_response is None:
+                print(f"Skipping prompt due to no response: {prompt}")
+                continue
+            json.dump({"prompt": prompt, "teacher_output": teacher_response}, f)
+            f.write("\n")
+    logging.info(f"KD dataset saved to {output_path}")
+    def evaluate_ta(kd_dataset_path):
+    """
+    Evaluate TA by feeding the same prompts and comparing to teacher.
+    """
+    with open(kd_dataset_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    total = len(lines)
+    for line in tqdm(lines, desc="Evaluating TA"):
+        data = json.loads(line)
+        prompt = data["prompt"]
+        ta_response = query_openrouter(TA_MODEL, [{"role": "user", "content": prompt}])
+        print(f"\nPrompt: {prompt}")
+        print(f"Teacher: {data['teacher_output']}")
+        print(f"TA: {ta_response}")
